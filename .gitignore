@@ -1,0 +1,12 @@
+.venv/
+.matplotlib/
+.runtime/
+*.log
+__pycache__/
+*.pyc
+*.db
+*.db-shm
+*.db-wal
+relatorio_*.pdf
+grafico.png
+preview_*.png
