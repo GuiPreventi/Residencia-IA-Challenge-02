@@ -1,61 +1,226 @@
 import argparse
 import json
 import os
+from cliente_graficos import gerar_grafico_evolucao
 import ollama
 from jinja2 import Template
 from pydantic import BaseModel
 from ambiente_pdf import configurar_bibliotecas_pdf
-
-configurar_bibliotecas_pdf()
-
-from weasyprint import HTML
-from database import buscar_dados_equipe_para_relatorio
-from cliente_graficos import gerar_grafico_evolucao
+from database import buscar_dados_equipe_para_relatorio, init_db, listar_equipes
 from datetime import date
 import re
 
 
-
-
 # =====================================================================
-# 1. SCHEMA DE SAÍDA DO AGENTE 2 (Apenas a parte analítica)
+# 2. SCHEMA DE SAÍDA DO AGENTE 2 (Apenas a parte analítica)
 # =====================================================================
 class AnaliseAgente2(BaseModel):
     analise_scores_e_historico: str
-    analise_prazos_e_carga_horaria: str | None = None  # Pode vir vazio (null)
     pontos_de_atencao: list[str]
     conclusao_grupo: str
 
+
+class AnaliseIndividual(BaseModel):
+    analise_scores_e_historico: str
+    pontos_de_atencao: list[str]
+    conclusao_individual: str
+
+
 # =====================================================================
-# 2. CHAMADA AO QWEN 3 8B (AGENTE 2)
+# 4. CHAMADA AO QWEN 3 8B (AGENTE 2)
 # =====================================================================
-def executar_agente_2(dados_grupo: dict) -> AnaliseAgente2:
+
+def buscar_contexto_completo_rag(
+    dados_grupo: dict,
+    mostrar_bastidores: bool = True,
+) -> tuple[str, list[str]]:
+    """Executa buscas separadas por tema no RAG para garantir BAT, Playbook e NR-01 no prompt."""
+    from rag import buscar_contexto_rag
+
+    pilares = dados_grupo.get("pilares", {})
+    if pilares:
+        pilar_critico, info = max(
+            pilares.items(),
+            key=lambda item: item[1].get("score") or 0
+        )
+        score_critico = info.get("score", 0)
+        tema_bat = "pilares_bat"
+        query_bat = f"Interpretação do pilar {pilar_critico} do BAT com score {score_critico:.2f}, sintomas, pontos de corte e correlações."
+        query_intervencoes = f"Intervenções organizacionais recomendadas quando o pilar {pilar_critico} do BAT está elevado ({score_critico:.2f})."
+    else:
+        tema_bat = "metodologia_bat"
+        query_bat = "Interpretação geral do Burnout Assessment Tool (BAT), pontos de corte e limitações."
+        query_intervencoes = "Principais causas organizacionais do burnout e intervenções recomendadas."
+
+    query_nr01 = "Obrigações da NR-01 no Gerenciamento de Riscos Ocupacionais (GRO) para riscos psicossociais e plano de ação."
+
+    buscas = [
+        ("REFERÊNCIAS DO BAT", query_bat, tema_bat, 3),
+        ("PLAYBOOK DE INTERVENÇÕES ORGANIZACIONAIS", query_intervencoes, "intervencoes", 3),
+        ("DIRETRIZES DA NR-01", query_nr01, "nr01", 2),
+    ]
+
+    blocos_contexto = []
+    fontes_unicas = []
+
+    for titulo, query, tema, n_cand in buscas:
+        if mostrar_bastidores:
+            print(f"\n--- Buscando tema: {tema} ---")
+
+        contexto, fontes = buscar_contexto_rag(
+            pergunta=query,
+            n_candidatos=n_cand,
+            filtro_tema=tema,
+            mostrar_bastidores=mostrar_bastidores,
+        )
+
+        if fontes:  # Só adiciona o bloco se encontrou trechos acima do limiar
+            blocos_contexto.append(f"### {titulo}\n{contexto}")
+            for f in fontes:
+                if f not in fontes_unicas:
+                    fontes_unicas.append(f)
+
+    if not blocos_contexto:
+        return "Nenhum material de referência específico encontrado na base de conhecimento.", []
+
+    return "\n\n".join(blocos_contexto), fontes_unicas
+
+
+
+MODELO_LLM = os.environ.get("OLLAMA_MODEL", "hf.co/bartowski/Qwen_Qwen3-8B-GGUF:Q3_K_M")
+
+
+def executar_agente_2(
+    dados_grupo: dict,
+    contexto_rag: str,
+    max_tentativas: int = 3,
+    individual: bool = False,
+) -> tuple[AnaliseAgente2 | AnaliseIndividual, str | None]:
+    """
+    Executa o Agente 2 com suporte a Tool Calling para a API de gráficos.
+    Retorna: (AnaliseAgente2, grafico_b64)
+    """
+    grafico_capturado: str | None = None
+
+    # --- Definição da Tool que o Agente pode chamar ---
+    def solicitar_grafico_evolucao_api() -> str:
+        """
+        Chama a API externa para gerar o gráfico de evolução temporal do score geral do grupo (BAT).
+        Use esta ferramenta quando houver histórico com 2 ou mais medições para enriquecer o relatório.
+        """
+        nonlocal grafico_capturado
+        try:
+            grafico_capturado = gerar_grafico_evolucao(dados_grupo.get("historico"), individual=individual)
+            if grafico_capturado:
+                return "Sucesso: o gráfico de evolução temporal foi gerado pela API externa e anexado ao relatório."
+            return "Aviso: a API informou que não há medições suficientes para gerar o gráfico."
+        except RuntimeError as e:
+            grafico_capturado = None
+            return f"Aviso: a API externa de gráficos está indisponível ({e}). Prossiga com a análise sem o gráfico."
+
+    if individual:
+        solicitar_grafico_evolucao_api.__doc__ = (
+            "Solicita à API o gráfico do histórico individual recebido. Use com pelo menos duas medições."
+        )
+    sujeito = "à avaliação individual fornecida, sem inferir resultados de equipe" if individual else "ao grupo"
+    schema = AnaliseIndividual if individual else AnaliseAgente2
     prompt = f"""
     Você é o Agente 2, um analista de dados organizacionais focado em bem-estar e prevenção de burnout.
-    Analise os dados JSON abaixo referentes ao grupo avaliado pelo instrumento BAT (Burnout Assessment Tool, escala de 1 a 5).
+    Analise os dados JSON abaixo referentes {sujeito}, pelo instrumento BAT (escala de 1 a 5).
+
+    Você possui a ferramenta `solicitar_grafico_evolucao_api` para gerar o gráfico de evolução temporal
+    via API externa. Se houver 2 ou mais registros no campo "historico", chame essa ferramenta
+    antes de redigir sua análise final.
+
+    Use o MATERIAL DE REFERÊNCIA abaixo para embasar sua interpretação técnica (pontos de corte,
+    significado dos pilares, NR-01 e recomendações práticas de intervenção).
+
+    === MATERIAL DE REFERÊNCIA (RAG) ===
+    {contexto_rag}
+    ====================================
 
     Regras:
     - Não faça diagnósticos clínicos. Trate os números como indicadores exploratórios.
-    - Correlacione a evolução dos scores com os prazos, carga horária e reuniões do grupo.
-    - Seja objetivo, técnico e escreva em português do Brasil.
-    - Se algum dado estiver ausente ou nulo (como histórico, prazos ou carga horária), NÃO invente informações. Retorne null no campo correspondente ou informe explicitamente que não há dados suficientes para aquela análise.
+    - Relacione os scores fornecidos com o histórico e os pilares do BAT.
+    - A análise individual é somente um protótipo exploratório, sem diagnóstico nem classificação clínica.
+    - Se houver itens faltantes, informe que o resultado é parcial. Não crie margens de erro.
+    - Se algum dado estiver ausente ou nulo, não invente informações.
+    - Seja conciso e direto: máximo de 1 parágrafo curto (3 a 4 frases) para a análise, até 5 itens curtos em pontos de atenção e 1 parágrafo curto para a conclusão.
+    - Escreva em português do Brasil.
 
-    Dados do Grupo:
+    Dados recebidos:
     {json.dumps(dados_grupo, ensure_ascii=False, indent=2)}
     """
 
-    response = ollama.chat(
-        model=os.environ.get("OLLAMA_MODEL", "hf.co/bartowski/Qwen_Qwen3-8B-GGUF:Q3_K_M"),
-        messages=[{"role": "user", "content": prompt}],
-        format=AnaliseAgente2.model_json_schema(),
-        think=False,
-        options={"temperature": 0.2},
-    )
-    return AnaliseAgente2.model_validate_json(response.message.content)
+    messages = [{"role": "user", "content": prompt}]
 
+    # -----------------------------------------------------------------
+    # ETAPA 1: O Agente decide se precisa chamar a Tool da API
+    # -----------------------------------------------------------------
+    print("   [Agente 2] Avaliando necessidade de chamar ferramentas (Tools)...")
+    resp_tool = ollama.chat(
+        model=MODELO_LLM,
+        messages=messages,
+        tools=[solicitar_grafico_evolucao_api],
+        think=False,
+        keep_alive="5m",
+        options={
+            "temperature": 0.1,
+            "num_ctx": 8192,
+        },
+    )
+
+    messages.append(resp_tool.message)
+
+    if resp_tool.message.tool_calls:
+        for tool_call in resp_tool.message.tool_calls:
+            nome_tool = tool_call.function.name
+            print(f"   [Agente 2] Decidiu chamar a tool: {nome_tool}")
+            if nome_tool == "solicitar_grafico_evolucao_api":
+                resultado_tool = solicitar_grafico_evolucao_api()
+                print(f"   [Tool -> Agente 2] {resultado_tool}")
+                messages.append({
+                    "role": "tool",
+                    "tool_name": nome_tool,
+                    "content": resultado_tool,
+                })
+    else:
+        print("   [Agente 2] Optou por não chamar nenhuma ferramenta.")
+
+    # -----------------------------------------------------------------
+    # ETAPA 2: Geração da análise final em JSON estruturado (Pydantic)
+    # -----------------------------------------------------------------
+    messages.append({
+        "role": "user",
+        "content": "Agora gere a análise final estritamente no formato JSON solicitado.",
+    })
+
+    ultimo_erro = None
+    for tentativa in range(1, max_tentativas + 1):
+        response = ollama.chat(
+            model=MODELO_LLM,
+            messages=messages,
+            format=schema.model_json_schema(),
+            think=False,
+            keep_alive="5m",
+            options={
+                "temperature": 0.2,
+                "num_ctx": 8192,
+                "num_predict": 1536,
+                "repeat_penalty": 1.15,
+            },
+        )
+        try:
+            analise = schema.model_validate_json(response.message.content)
+            return analise, grafico_capturado
+        except Exception as e:
+            ultimo_erro = e
+            print(f"   [Aviso] Tentativa {tentativa}/{max_tentativas} retornou JSON incompleto. Tentando novamente...")
+
+    raise RuntimeError(f"Agente 2 falhou após {max_tentativas} tentativas: {ultimo_erro}")
 
 # =====================================================================
-# 3. TEMPLATE HTML COM OS 4 BLOCOS (BLOCO 0 AO BLOCO 3)
+# 5. TEMPLATE HTML COM OS 4 BLOCOS (BLOCO 0 AO BLOCO 3)
 # =====================================================================
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -134,49 +299,15 @@ HTML_TEMPLATE = """
             <img src="data:image/png;base64,{{ grafico_b64 }}" alt="Evolução Temporal do Grupo">
         </div>
     {% else %}
-        <p class="vazio">Histórico insuficiente para gerar gráfico de evolução temporal (mínimo de 2 medições).</p>
+        <p class="vazio">Gráfico de evolução temporal indisponível.</p>
     {% endif %}
 
-    <h3>Prazos de Atividades e Carga Horária</h3>
-    {% if grupo.rotina_e_prazos %}
-        <ul>
-            <li><strong>Carga Horária Média:</strong> {{ grupo.rotina_e_prazos.carga_horaria_media_semanal or "Não informada" }}</li>
-            <li><strong>Reuniões:</strong> {{ grupo.rotina_e_prazos.reunioes_semanais or "Não informadas" }}</li>
-        </ul>
-
-        {% if grupo.rotina_e_prazos.proximos_prazos %}
-            <table>
-                <thead>
-                    <tr><th>Entrega / Atividade</th><th>Prazo</th><th>Status</th></tr>
-                </thead>
-                <tbody>
-                    {% for item in grupo.rotina_e_prazos.proximos_prazos %}
-                    <tr>
-                        <td>{{ item.entrega or "Sem descrição" }}</td>
-                        <td>{{ item.prazo or "Não definido" }}</td>
-                        <td>{{ item.status or "N/A" }}</td>
-                    </tr>
-                    {% endfor %}
-                </tbody>
-            </table>
-        {% else %}
-            <p class="vazio">Nenhum prazo de entrega registrado para este período.</p>
-        {% endif %}
-    {% else %}
-        <p class="vazio">Dados de rotina, carga horária e prazos não fornecidos.</p>
-    {% endif %}
 
     <h3>Análise e Conclusão do Agente 2</h3>
     {% if analise %}
         <div class="analise-box">
             {% if analise.analise_scores_e_historico %}
                 <p><strong>Análise de Scores e Histórico:</strong> {{ analise.analise_scores_e_historico }}</p>
-            {% endif %}
-
-            {% if analise.analise_prazos_e_carga_horaria %}
-                <p><strong>Análise de Prazos e Carga Horária:</strong> {{ analise.analise_prazos_e_carga_horaria }}</p>
-            {% else %}
-                <p class="vazio">Análise de prazos e carga horária não realizada por ausência de dados.</p>
             {% endif %}
 
             {% if analise.pontos_de_atencao %}
@@ -192,6 +323,14 @@ HTML_TEMPLATE = """
                 <p><strong>Conclusão sobre o Grupo:</strong> {{ analise.conclusao_grupo }}</p>
             {% endif %}
         </div>
+
+        {% if fontes_rag %}
+            <p style="font-size: 10px; color: #555; margin-top: 10px;">
+                <strong>Referências consultadas (RAG):</strong> {{ fontes_rag | join('; ') }}
+            </p>
+        {% endif %}
+
+
     {% else %}
         <p class="vazio">Análise do Agente 2 indisponível.</p>
     {% endif %}
@@ -282,25 +421,83 @@ HTML_TEMPLATE = """
 </html>
 """
 
+def selecionar_equipe_menu(entrada=input, saida=print) -> int | None:
+    """Exibe um menu no terminal com as equipes cadastradas no SQLite e retorna o IdEquipe escolhido."""
+    init_db()
+    equipes = listar_equipes()
+    if not equipes:
+        saida("Nenhuma equipe encontrada no banco de dados. Execute o Agente 1 ou cadastre uma equipe primeiro.")
+        return None
+
+    saida("\n=== Seleção de Equipe para Relatório (Agente 2) ===")
+    for idx, eq in enumerate(equipes, start=1):
+        membros = eq.get("membros_avaliados", 0)
+        avals = eq.get("total_avaliacoes", 0)
+        lbl_m = "membro avaliado" if membros == 1 else "membros avaliados"
+        lbl_a = "avaliação" if avals == 1 else "avaliações"
+        saida(f"  {idx}. {eq['nome']} (ID {eq['id']} | {membros} {lbl_m}, {avals} {lbl_a})")
+    saida("  0. Sair")
+
+    while True:
+        try:
+            bruto = entrada("\nEscolha o número da equipe para gerar o relatório: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            saida("")
+            return None
+
+        if not bruto:
+            continue
+        resp = bruto.lower()
+        if resp in ("0", "sair", "exit", "quit"):
+            return None
+        if resp.isdigit():
+            indice = int(resp)
+            if 1 <= indice <= len(equipes):
+                escolhida = equipes[indice - 1]
+                saida(f"Equipe selecionada: {escolhida['nome']} (ID {escolhida['id']})\n")
+                return escolhida["id"]
+        else:
+            for eq in equipes:
+                if eq["nome"].strip().lower() == resp:
+                    saida(f"Equipe selecionada: {eq['nome']} (ID {eq['id']})\n")
+                    return eq["id"]
+
+        saida(f"Opção inválida. Digite um número de 1 a {len(equipes)} (ou 0 para sair).")
+
+
 # =====================================================================
-# 4. EXECUÇÃO DO PIPELINE (GRÁFICO OBTIDO VIA API)
+# 6. EXECUÇÃO DO PIPELINE
 # =====================================================================
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Gera o relatório BAT com gráfico obtido pela API.")
-    parser.add_argument("--sem-analise", action="store_true",
-                        help="Gera o PDF sem chamar Ollama; a ausência de análise é indicada no relatório.")
-    parser.add_argument("--equipe", type=int, default=1, help="ID da equipe no banco (padrão: 1).")
+    configurar_bibliotecas_pdf()
+    from weasyprint import HTML
+    parser = argparse.ArgumentParser(description="Gera relatório de monitoramento BAT em PDF via Agente 2.")
+    parser.add_argument(
+        "--equipe",
+        type=int,
+        default=None,
+        help="ID da equipe no SQLite para geração direta do relatório (se omitido, abre o menu no terminal).",
+    )
     args = parser.parse_args()
-    dados = buscar_dados_equipe_para_relatorio(id_equipe=args.equipe)
-    print("1. Solicitando gráfico temporal à API...")
-    grafico_b64 = gerar_grafico_evolucao(dados["grupo"]["historico"])
 
-    if args.sem_analise:
-        print("2. Análise textual desativada explicitamente (--sem-analise).")
-        analise_agente_2 = None
-    else:
-        print("2. Chamando Qwen 3 8B (Agente 2) para gerar a análise...")
-        analise_agente_2 = executar_agente_2(dados["grupo"])
+    id_equipe = args.equipe
+    if id_equipe is None:
+        id_equipe = selecionar_equipe_menu()
+        if id_equipe is None:
+            print("Operação cancelada.")
+            raise SystemExit(0)
+
+    print(f"0. Buscando dados da equipe {id_equipe} no SQLite...")
+    dados = buscar_dados_equipe_para_relatorio(id_equipe=id_equipe)
+
+    print("1. Consultando base de conhecimento (RAG por tema)...")
+    contexto_rag, fontes_rag = buscar_contexto_completo_rag(
+        dados["grupo"],
+        mostrar_bastidores=True,
+    )
+
+    print("2. Chamando Qwen 3 8B (Agente 2) com RAG e Tool da API...")
+    analise_agente_2, grafico_b64 = executar_agente_2(dados["grupo"], contexto_rag)
 
     print("3. Renderizando HTML e gerando PDF...")
     html_final = Template(HTML_TEMPLATE).render(
@@ -308,12 +505,12 @@ if __name__ == "__main__":
         membros=dados["membros"],
         grafico_b64=grafico_b64,
         analise=analise_agente_2,
+        fontes_rag=fontes_rag,
     )
 
     nome_grupo = dados["grupo"]["nome"] or "grupo_sem_nome"
     nome_limpo = re.sub(r"[^\w\-]+", "_", nome_grupo).strip("_")
-    data_hoje = date.today().strftime("%Y-%m-%d")  # Ex: 2026-11-24
-
+    data_hoje = date.today().strftime("%Y-%m-%d")
     nome_arquivo = f"relatorio_{nome_limpo}_{data_hoje}.pdf"
 
     HTML(string=html_final).write_pdf(nome_arquivo)

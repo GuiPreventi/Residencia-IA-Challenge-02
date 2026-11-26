@@ -1,121 +1,164 @@
-# API externa do Agente 2
+# Comunicação entre agentes com LangGraph
 
-Serviço HTTP independente para gerar o gráfico **Evolução Temporal do Score Geral do Grupo (BAT)**. O agente envia o histórico e recebe um PNG em Base64, pronto para o relatório. A API não precisa de SQLite, Ollama ou WeasyPrint.
+Protótipo pelo terminal, integrado aos códigos atualizados fornecidos no ZIP.
+Assim que o agente 1 conclui e salva a coleta no SQLite, o LangGraph passa o ID
+salvo ao agente 2 e gera um PDF **individual**, como definido para este protótipo.
 
-## Instalar e iniciar a API
+```mermaid
+flowchart LR
+    Inicio --> Agente1[Agente 1: coleta e gravação]
+    Agente1 -->|Avaliação salva| Leitura[Ler avaliação individual pelo ID]
+    Agente1 -->|Cancelamento ou falha| Fim
+    Leitura --> RAG[Consultar RAG]
+    RAG --> Agente2[Agente 2: análise e ferramenta de gráfico]
+    Agente2 --> PDF[Gerar PDF individual]
+    PDF --> Fim
+```
 
-Use Python 3.10 ou superior. No Windows, recomenda-se **Python 3.14** para também instalar as bibliotecas nativas de PDF com o instalador incluído.
+O grafo real está em `comunicacao_agentes.py`, usando `StateGraph`, nós e rotas
+condicionais do [LangGraph](https://docs.langchain.com/oss/python/langgraph/graph-api).
+O estado compartilhado contém o ID e os dados persistidos; não transporta o texto
+livre da conversa. O protótipo não usa checkpoints persistentes do LangGraph.
+
+## Instalação
+
+Python 3.10+ para o código. No Windows x64, use **Python 3.14+** para o instalador
+local das dependências nativas de PDF.
 
 ```powershell
-git clone --branch api-externa-agente2 --single-branch https://github.com/GuiPreventi/Residencia-IA-Challenge-02.git
-cd Residencia-IA-Challenge-02
 python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt -r requirements-comunicacao.txt
+.\.venv\Scripts\python.exe instalar_bibliotecas_pdf.py
+```
+
+O último comando é específico do Windows: instala Pango e dependências oficiais
+MSYS2 em `.runtime/`, verificando SHA256, sem alterar o PATH global. Em Linux/macOS,
+instale as bibliotecas nativas conforme a [documentação do WeasyPrint](https://doc.courtbouillon.org/weasyprint/stable/first_steps.html#installation).
+Em Linux/macOS, use `.venv/bin/python` no lugar de `.\.venv\Scripts\python.exe`.
+
+## Executar a simulação autorizada
+
+No primeiro terminal, inicie a API de gráficos:
+
+```powershell
 .\.venv\Scripts\python.exe -m uvicorn api:app --host 127.0.0.1 --port 8000
 ```
 
-Deixe esse terminal aberto. Em Linux/macOS, use `.venv/bin/python` no lugar de `.\.venv\Scripts\python.exe` nos comandos deste documento.
+No segundo terminal, na mesma pasta:
 
-- Documentação interativa: http://127.0.0.1:8000/docs
-- Contrato OpenAPI: http://127.0.0.1:8000/openapi.json
-- Disponibilidade: `GET /health`, com resposta `{"status": "ok"}`.
+```powershell
+.\.venv\Scripts\python.exe comunicacao_agentes.py --simulado
+```
 
-## Gerar um gráfico
+Esse modo não chama Ollama, não consulta documentos reais e não necessita das
+dependências do RAG. Usa 12 notas fixas fictícias, a rotina de finalização do agente 1,
+o banco `simulacao/burnout_prototype.db`, a análise artificial identificada e a
+API real de gráficos. O PDF é criado em `relatorios/simulacao/` e recebe o aviso
+**SIMULAÇÃO DE TESTE**. As notas, respostas artificiais e fontes vazias estão
+explícitas em `simulacao_agentes.py`; não representam resultados de pessoas reais.
 
-`POST /graficos/evolucao-score`, com `Content-Type: application/json`:
+Uma primeira coleta tem somente uma medição: nesse caso, a API retorna `null`
+e o PDF informa histórico insuficiente. Não é criado um segundo ponto fictício
+para forçar um gráfico. O gráfico é incorporado quando existe histórico individual
+suficiente e a ferramenta é chamada pelo agente 2.
+
+## Executar com os agentes e Ollama reais
+
+Instale também as dependências do RAG fornecido:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-rag.txt
+```
+
+O ZIP não contém `Documentos/` nem a base vetorial `BancoDados/`. Para usar o RAG,
+forneça seus documentos reais em `Documentos/` e execute:
+
+```powershell
+.\.venv\Scripts\python.exe ingestao.py
+```
+
+O módulo usa ChromaDB, a coleção `documentos_rag` e embeddings
+`intfloat/multilingual-e5-small` em CPU, como nos códigos recebidos. A primeira
+execução pode baixar o modelo de embeddings. Não foram criados documentos ou
+fontes de referência para preencher uma base ausente.
+
+Com a API de gráficos e o Ollama disponíveis e o modelo já instalado:
+
+```powershell
+.\.venv\Scripts\python.exe comunicacao_agentes.py
+```
+
+A interação de consentimento, escolha de equipe e coleta usa o agente 1 recebido.
+O aviso de consentimento do protótipo informa a geração individual. O modo normal
+continua usando Ollama e o RAG fornecido, sem respostas simuladas de fallback.
+
+Configurações existentes dos agentes:
+
+| Variável | Uso |
+| --- | --- |
+| `LOCAL_MODEL` | Modelo do agente 1 |
+| `OLLAMA_URL` | Endereço Ollama do agente 1; padrão `http://localhost:11434` |
+| `OLLAMA_MODEL` | Modelo do agente 2 |
+| `OLLAMA_HOST` | Endereço usado pelo cliente Ollama do agente 2 |
+| `GRAFICOS_API_URL` | API de gráficos; padrão `http://127.0.0.1:8000` |
+
+O modelo padrão dos dois agentes foi mantido:
+`hf.co/bartowski/Qwen_Qwen3-8B-GGUF:Q3_K_M`.
+
+## Banco, falhas e retomada
+
+O novo `database.py` inclui `listar_equipes()` e migração idempotente de
+`ItensFaltantes`. Foram preservados os parâmetros de equipe usados pelo script
+anterior de demonstração. As conexões são fechadas após cada transação.
+
+A gravação da coleta agora é atômica: equipe, usuário, avaliação, itens faltantes
+e respostas são confirmados juntos. A sessão só recebe `id_avaliacao` após o
+commit. Cancelamento, risco ou falha de gravação impedem o acionamento do agente 2.
+
+A leitura individual usa o ID exato e consulta somente o histórico daquele usuário
+até a avaliação selecionada. Não calcula médias da equipe, não acrescenta margens
+de erro e não inclui texto livre ou dados de outras pessoas no PDF.
+
+Se RAG, Ollama ou PDF falharem depois da gravação, o fluxo informa a falha e mantém
+a avaliação salva. Para retomar sem repetir a coleta, use o ID e o mesmo banco:
+
+```powershell
+.\.venv\Scripts\python.exe comunicacao_agentes.py --avaliacao 1 --banco burnout_prototype.db
+```
+
+Para retomar uma simulação:
+
+```powershell
+.\.venv\Scripts\python.exe comunicacao_agentes.py --simulado --avaliacao 1
+```
+
+Também é possível escolher `--banco CAMINHO` e `--saida PASTA`. JSON inválido do
+modelo resulta em falha explícita após as tentativas existentes do agente 2;
+não é substituído por uma análise inventada. Uma falha apenas da API de gráficos
+mantém o comportamento fornecido: o agente 2 pode prosseguir com o PDF sem imagem.
+
+O `agente1.py` e o `criaDoc.py` continuam disponíveis isoladamente. A comunicação
+automática e o PDF individual são iniciados por `comunicacao_agentes.py`.
+
+## API de gráficos
+
+- `GET /health` verifica disponibilidade.
+- `POST /graficos/evolucao-score` recebe histórico e retorna PNG em Base64.
+- Documentação: http://127.0.0.1:8000/docs
 
 ```json
 {
   "historico": [
-    {"data": "2026-08", "score_geral": 2.15},
-    {"data": "2026-09", "score_geral": 2.40},
     {"data": "2026-10", "score_geral": 2.75},
-    {"data": "Atual", "score_geral": 2.97}
-  ]
+    {"data": "2026-11", "score_geral": 2.97}
+  ],
+  "escopo": "individual"
 }
 ```
 
-Resposta HTTP 200 (`...` representa o restante do Base64):
-
-```json
-{"grafico_b64": "iVBORw0KGgo...", "formato": "png", "mensagem": null}
-```
-
-Teste no segundo terminal PowerShell para salvar e abrir a imagem:
-
-```powershell
-$body = @{
-    historico = @(
-        @{ data = '2026-10'; score_geral = 2.75 }
-        @{ data = 'Atual'; score_geral = 2.97 }
-    )
-} | ConvertTo-Json -Depth 4
-$resultado = Invoke-RestMethod -Method Post `
-    -Uri 'http://127.0.0.1:8000/graficos/evolucao-score' `
-    -ContentType 'application/json' -Body $body
-$arquivo = Join-Path $PWD 'grafico.png'
-[IO.File]::WriteAllBytes($arquivo, [Convert]::FromBase64String($resultado.grafico_b64))
-Invoke-Item $arquivo
-```
-
-Envie o histórico em ordem temporal: a ordem recebida é preservada, inclusive os rótulos `YYYY-MM`, `YYYY-MM-DD` e `Atual`. A escala é de 1 a 5. Scores nulos são ignorados; histórico nulo, ausente ou com menos de duas medições válidas retorna HTTP 200 com `grafico_b64: null` e uma mensagem. Entradas inválidas retornam HTTP 422. São aceitas até 1.000 medições por chamada.
-
-O gráfico mantém as cores, o título e as referências 2,59 e 3,02 do agente original.
-
-## Integrar com o agente
-
-Inclua `cliente_graficos.py` junto do agente e substitua a geração local por:
-
-```python
-from cliente_graficos import gerar_grafico_evolucao
-
-grafico_b64 = gerar_grafico_evolucao(dados["grupo"]["historico"])
-```
-
-O cliente usa somente a biblioteca padrão, tem timeout de 30 segundos e retorna `str | None`. Em falhas de comunicação ou respostas inválidas, lança `RuntimeError`. O template pode continuar usando `<img src="data:image/png;base64,{{ grafico_b64 }}">`.
-
-A versão de `criaDoc.py` deste repositório já faz essa chamada. Ela ocorre no pipeline Python do agente; o modelo Ollama realiza a análise textual.
-
-Para uma API hospedada em outro servidor, configure no terminal do agente:
-
-```powershell
-$env:GRAFICOS_API_URL = 'https://seu-servidor.exemplo'
-```
-
-A configuração padrão escuta somente na máquina local. Para publicar o serviço, configure a hospedagem e o acesso externo conforme o ambiente do projeto.
-
-## Gerar o relatório PDF de exemplo
-
-Com a API rodando, no segundo terminal:
-
-```powershell
-.\.venv\Scripts\python.exe -m pip install -r requirements-agente.txt
-.\.venv\Scripts\python.exe instalar_bibliotecas_pdf.py
-.\.venv\Scripts\python.exe populaDataset.py
-.\.venv\Scripts\python.exe criaDoc.py --sem-analise
-```
-
-`instalar_bibliotecas_pdf.py` é destinado ao **Windows x64 com Python 3.14+**. Obtém Pango e suas dependências do repositório oficial do MSYS2, verifica o SHA256 de cada pacote e instala em `.runtime/`. Não altera o PATH global. `ambiente_pdf.py` configura as DLLs e o cache de fontes automaticamente. As bibliotecas e o ambiente virtual não são versionados; execute a instalação no computador onde rodará o PDF.
-
-Em Linux/macOS, instale as dependências nativas segundo a [documentação do WeasyPrint](https://doc.courtbouillon.org/weasyprint/stable/first_steps.html#installation) em vez de executar o instalador para Windows.
-
-`populaDataset.py` cria um banco SQLite de demonstração com 3 membros e histórico do grupo. Preserva um banco existente e só o substitui com `--recriar`. O banco `burnout_prototype.db` e o PDF são criados na pasta atual, não são versionados e não são necessários para executar apenas a API.
-
-`--sem-analise` gera o PDF sem chamar Ollama e indica no documento que a análise está indisponível. Não são inventadas análises. Para a análise real, instale e inicie Ollama, baixe o modelo e execute sem essa opção:
-
-```powershell
-ollama pull hf.co/bartowski/Qwen_Qwen3-8B-GGUF:Q3_K_M
-.\.venv\Scripts\python.exe criaDoc.py
-```
-
-Opcionalmente, selecione outro modelo e outra equipe:
-
-```powershell
-$env:OLLAMA_MODEL = 'seu-modelo-instalado'
-.\.venv\Scripts\python.exe criaDoc.py --equipe 1
-```
-
-O modelo escolhido deve suportar a saída JSON estruturada usada pelo agente.
+`escopo` é opcional e mantém `grupo` como padrão para compatibilidade. Scores
+válidos estão entre 1 e 5; valores nulos são ignorados. Com menos de duas medições,
+`grafico_b64` é `null`. Dados inválidos retornam HTTP 422. A ordem recebida é mantida.
 
 ## Testes
 
@@ -124,20 +167,13 @@ O modelo escolhido deve suportar a saída JSON estruturada usada pelo agente.
 .\.venv\Scripts\python.exe -B -m unittest discover -s tests -v
 ```
 
-Os seis testes verificam PNG válido, integração com histórico do banco, dados inválidos, histórico insuficiente, falhas do cliente e uma chamada HTTP real. O teste HTTP inicia e encerra sua própria API em uma porta temporária; não exige um servidor previamente rodando nem deixa o serviço ativo. Não precisa de Ollama ou das bibliotecas de PDF. O GitHub Actions executa a suíte em Python 3.10 e 3.14.
+É necessário instalar as bibliotecas nativas de PDF descritas acima. Ollama e
+ChromaDB são simulados nos testes; o grafo, SQLite, renderização de gráficos e
+PDF são reais. Os testes incluem cancelamento, risco, rollback, falha do agente 2,
+retomada sem duplicação, avaliação parcial, separação de pessoas, JSON inválido,
+migrações e gráfico incorporado ao PDF. Há também um teste HTTP com Uvicorn real,
+que inicia e encerra sua própria API em porta temporária.
 
-## Arquivos
-
-| Arquivo | Função |
-| --- | --- |
-| `api.py` | Endpoint FastAPI e geração do PNG |
-| `cliente_graficos.py` | Cliente HTTP para integrar ao agente |
-| `criaDoc.py` | Pipeline de análise, chamada à API e geração do PDF |
-| `database.py` | Acesso ao SQLite e consolidação do grupo |
-| `populaDataset.py` | Dados fictícios para testar o relatório |
-| `ambiente_pdf.py` | Configuração das bibliotecas nativas no Windows |
-| `instalar_bibliotecas_pdf.py` | Instalação local de Pango e dependências |
-| `requirements.txt` | Dependências da API |
-| `requirements-agente.txt` | Dependências opcionais do relatório e Ollama |
-| `requirements-dev.txt` | Dependências dos testes |
-| `tests/` | Testes da API, cliente, banco e HTTP |
+As dependências pesadas de RAG são opcionais e não são baixadas na suíte.
+O GitHub Actions configura as bibliotecas de PDF e roda os testes em Python
+3.10 e 3.14. Bancos, PDFs, ambientes virtuais e DLLs não são versionados.

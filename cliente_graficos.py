@@ -6,12 +6,15 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 
-def gerar_grafico_evolucao(historico: list[dict] | None) -> str | None:
+def gerar_grafico_evolucao(historico: list[dict] | None, *, individual: bool = False) -> str | None:
     """Mantém o contrato original, delegando a geração à API externa."""
     base_url = os.environ.get("GRAFICOS_API_URL", "http://127.0.0.1:8000").rstrip("/")
+    dados = {"historico": historico}
+    if individual:
+        dados["escopo"] = "individual"
     pedido = Request(
         f"{base_url}/graficos/evolucao-score",
-        data=json.dumps({"historico": historico}, ensure_ascii=False, allow_nan=False).encode("utf-8"),
+        data=json.dumps(dados, ensure_ascii=False, allow_nan=False).encode("utf-8"),
         headers={"Content-Type": "application/json", "Accept": "application/json"},
         method="POST",
     )

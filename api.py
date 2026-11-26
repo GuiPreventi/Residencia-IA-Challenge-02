@@ -3,6 +3,7 @@
 import base64
 import io
 from threading import Lock
+from typing import Literal
 
 from fastapi import FastAPI
 from matplotlib.backends.backend_agg import FigureCanvasAgg
@@ -26,6 +27,7 @@ class PedidoGrafico(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     historico: list[Medicao] | None = Field(default=None, max_length=1000)
+    escopo: Literal["grupo", "individual"] = "grupo"
 
 
 class RespostaGrafico(BaseModel):
@@ -72,7 +74,9 @@ def gerar_grafico_evolucao(pedido: PedidoGrafico) -> RespostaGrafico:
                          label="Zona de Atenção (Ref. Externa)")
             eixo.axhline(3.02, color="#c53030", linestyle="--", linewidth=1,
                          label="Zona Crítica (Ref. Externa)")
-            eixo.set_title("Evolução Temporal do Score Geral do Grupo (BAT)", fontsize=11, pad=10)
+            titulo = ("Evolução Temporal do Score Geral Individual (BAT)" if pedido.escopo == "individual"
+                      else "Evolução Temporal do Score Geral do Grupo (BAT)")
+            eixo.set_title(titulo, fontsize=11, pad=10)
             eixo.set_ylabel("Score (1 a 5)")
             eixo.grid(axis="y", linestyle=":", alpha=0.6)
             eixo.legend(fontsize=8, loc="upper left")

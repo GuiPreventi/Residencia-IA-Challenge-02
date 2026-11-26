@@ -1,2 +1,4 @@
 -r requirements.txt
 httpx>=0.27,<1
+-r requirements-comunicacao.txt
+pypdf>=5,<8

@@ -1,87 +1,15 @@
-import json
 import sqlite3
 from pathlib import Path
+import json
+from contextlib import nullcontext
 
 DB_PATH = Path("burnout_prototype.db")
 
 
-def get_connection() -> sqlite3.Connection:
-    """Abre uma conexão configurada com o SQLite."""
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row  # Permite acessar colunas pelo nome: row["NomeEquipe"]
-    conn.execute("PRAGMA foreign_keys = ON;")
-    conn.execute("PRAGMA journal_mode = WAL;")
-    return conn
-
-
-def init_db() -> None:
-    """Cria as tabelas do banco caso ainda não existam."""
-    schema_sql = """
-    CREATE TABLE IF NOT EXISTS Equipe (
-        IdEquipe INTEGER PRIMARY KEY AUTOINCREMENT,
-        NomeEquipe TEXT NOT NULL,
-        IdCalendarioGoogle TEXT,
-        IdEquipeTeams TEXT
-    );
-
-    CREATE TABLE IF NOT EXISTS Usuario (
-        IdUsuario INTEGER PRIMARY KEY AUTOINCREMENT,
-        Login TEXT NOT NULL UNIQUE,
-        Senha TEXT NOT NULL,
-        IsRH INTEGER NOT NULL DEFAULT 0, -- 0 = Colaborador, 1 = RH
-        IdEquipe INTEGER,
-        FOREIGN KEY (IdEquipe) REFERENCES Equipe(IdEquipe) ON DELETE SET NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS Avaliacao (
-        IdAvaliacao INTEGER PRIMARY KEY AUTOINCREMENT,
-        IdUsuario INTEGER NOT NULL,
-        Data TEXT NOT NULL, -- Formato recomendado: YYYY-MM-DD
-        ScoreGeral REAL,
-        MargemErroGeral REAL,
-        ScorePilaresJSON TEXT,      -- Ex: {"Exaustão": 3.8, "Distanciamento Mental": 3.1, ...}
-        MargemErroPilaresJSON TEXT, -- Ex: {"Exaustão": 0.4, "Distanciamento Mental": 0.3, ...}
-        FOREIGN KEY (IdUsuario) REFERENCES Usuario(IdUsuario) ON DELETE CASCADE
-    );
-
-    CREATE TABLE IF NOT EXISTS Respostas (
-        IdRespostas INTEGER PRIMARY KEY AUTOINCREMENT,
-        IdAvaliacao INTEGER NOT NULL,
-        Pilar TEXT NOT NULL,
-        Pergunta TEXT NOT NULL,
-        Resposta TEXT NOT NULL,
-        Nota INTEGER NOT NULL,
-        JustificativaAgente TEXT NOT NULL,
-        FOREIGN KEY (IdAvaliacao) REFERENCES Avaliacao(IdAvaliacao) ON DELETE CASCADE
-    );
-
-    CREATE TABLE IF NOT EXISTS RelatorioEquipe (
-        IdRelatorio INTEGER PRIMARY KEY AUTOINCREMENT,
-        IdEquipe INTEGER NOT NULL,
-        DataRelatorio TEXT NOT NULL, -- Formato recomendado: YYYY-MM ou YYYY-MM-DD
-        ScoreGeral REAL,
-        MargemErroGeral REAL,
-        ScorePilaresJSON TEXT,
-        MargemErroPilaresJSON TEXT,
-        AnaliseAgente TEXT,
-        ConclusaoAgente TEXT,
-        SnapshotContextoAPIJSON TEXT, -- Cópia opcional dos prazos/reuniões da data
-        FOREIGN KEY (IdEquipe) REFERENCES Equipe(IdEquipe) ON DELETE CASCADE
-    );
-    """
-
-    with get_connection() as conn:
-        conn.executescript(schema_sql)
-
-
 # =====================================================================
-# FUNÇÕES DE CADASTRO E ESCRITA (ADMIN E AGENTE 1)
+# FUNÇÕES DE ESCRITA (Admin e Agente 1)
 # =====================================================================
-def criar_equipe(
-    nome: str,
-    id_calendario: str | None = None,
-    id_teams: str | None = None,
-) -> int:
+def criar_equipe(nome: str, id_calendario: str | None = None, id_teams: str | None = None) -> int:
     with get_connection() as conn:
         cur = conn.execute(
             "INSERT INTO Equipe (NomeEquipe, IdCalendarioGoogle, IdEquipeTeams) VALUES (?, ?, ?)",
@@ -90,12 +18,35 @@ def criar_equipe(
         return cur.lastrowid
 
 
-def criar_usuario(
-    login: str,
-    senha: str,
-    id_equipe: int | None = None,
-    is_rh: int = 0,
-) -> int:
+def listar_equipes() -> list[dict]:
+    """Retorna as equipes cadastradas no banco em ordem de criação, com contagem de avaliações."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                e.IdEquipe,
+                e.NomeEquipe,
+                COUNT(DISTINCT CASE WHEN u.IsRH = 0 AND a.IdAvaliacao IS NOT NULL THEN u.IdUsuario END) AS MembrosAvaliados,
+                COUNT(CASE WHEN u.IsRH = 0 THEN a.IdAvaliacao END) AS TotalAvaliacoes
+            FROM Equipe e
+            LEFT JOIN Usuario u ON u.IdEquipe = e.IdEquipe
+            LEFT JOIN Avaliacao a ON a.IdUsuario = u.IdUsuario
+            GROUP BY e.IdEquipe, e.NomeEquipe
+            ORDER BY e.IdEquipe ASC
+            """
+        ).fetchall()
+        return [
+            {
+                "id": r["IdEquipe"],
+                "nome": r["NomeEquipe"],
+                "membros_avaliados": r["MembrosAvaliados"],
+                "total_avaliacoes": r["TotalAvaliacoes"],
+            }
+            for r in rows
+        ]
+
+
+def criar_usuario(login: str, senha: str, id_equipe: int | None = None, is_rh: int = 0) -> int:
     with get_connection() as conn:
         cur = conn.execute(
             "INSERT INTO Usuario (Login, Senha, IsRH, IdEquipe) VALUES (?, ?, ?, ?)",
@@ -107,19 +58,22 @@ def criar_usuario(
 def salvar_avaliacao_agente1(
     id_usuario: int,
     data: str,
-    score_geral: float,
-    margem_erro_geral: float,
+    score_geral: float | None,
+    margem_erro_geral: float | None,
     score_pilares: dict,
     margem_erro_pilares: dict,
     respostas: list[dict],
+    itens_faltantes: int = 0,
+    _conn: sqlite3.Connection | None = None,
 ) -> int:
     """Salva a avaliação individual e todas as respostas do Agente 1 na mesma transação."""
-    with get_connection() as conn:
+    with (get_connection() if _conn is None else nullcontext(_conn)) as conn:
         cur = conn.execute(
             """
             INSERT INTO Avaliacao (
-                IdUsuario, Data, ScoreGeral, MargemErroGeral, ScorePilaresJSON, MargemErroPilaresJSON
-            ) VALUES (?, ?, ?, ?, ?, ?)
+                IdUsuario, Data, ScoreGeral, MargemErroGeral, ScorePilaresJSON, MargemErroPilaresJSON,
+                ItensFaltantes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 id_usuario,
@@ -128,6 +82,7 @@ def salvar_avaliacao_agente1(
                 margem_erro_geral,
                 json.dumps(score_pilares, ensure_ascii=False),
                 json.dumps(margem_erro_pilares, ensure_ascii=False),
+                itens_faltantes,
             ),
         )
         id_avaliacao = cur.lastrowid
@@ -151,8 +106,65 @@ def salvar_avaliacao_agente1(
         return id_avaliacao
 
 
+def salvar_coleta_agente1(id_anonimo, equipe, periodo, score_geral, score_pilares,
+                         respostas, itens_faltantes):
+    """Salva equipe, usuário, avaliação e respostas em uma única transação."""
+    nome = " ".join(str(equipe).split()).strip()
+    with get_connection() as conn:
+        linha = conn.execute(
+            "SELECT IdEquipe FROM Equipe WHERE LOWER(TRIM(NomeEquipe)) = LOWER(?)", (nome,)
+        ).fetchone()
+        id_equipe = linha["IdEquipe"] if linha else conn.execute(
+            "INSERT INTO Equipe (NomeEquipe) VALUES (?)", (nome,)
+        ).lastrowid
+        id_usuario = conn.execute(
+            "INSERT INTO Usuario (Login, Senha, IdEquipe) VALUES (?, ?, ?)",
+            (id_anonimo, "-", id_equipe),
+        ).lastrowid
+        id_avaliacao = salvar_avaliacao_agente1(
+            id_usuario, periodo, score_geral, None, score_pilares,
+            {p: None for p in score_pilares}, respostas,
+            itens_faltantes=itens_faltantes, _conn=conn,
+        )
+    return id_avaliacao
+
+
+def buscar_avaliacao_individual(id_avaliacao: int) -> dict:
+    """Lê exclusivamente a avaliação solicitada e o histórico desse usuário até ela."""
+    with get_connection() as conn:
+        row = conn.execute(
+            """SELECT a.*, u.Login, e.NomeEquipe FROM Avaliacao a
+               JOIN Usuario u ON u.IdUsuario = a.IdUsuario
+               LEFT JOIN Equipe e ON e.IdEquipe = u.IdEquipe
+               WHERE a.IdAvaliacao = ?""", (id_avaliacao,)
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"Avaliação {id_avaliacao} não encontrada.")
+        scores = json.loads(row["ScorePilaresJSON"] or "{}")
+        margens = json.loads(row["MargemErroPilaresJSON"] or "{}")
+        historico = conn.execute(
+            """SELECT Data, ScoreGeral FROM Avaliacao
+               WHERE IdUsuario = ? AND IdAvaliacao <= ? ORDER BY IdAvaliacao""",
+            (row["IdUsuario"], id_avaliacao),
+        ).fetchall()
+        respostas = conn.execute(
+            "SELECT Pilar, Pergunta, Nota FROM Respostas WHERE IdAvaliacao = ? ORDER BY IdRespostas",
+            (id_avaliacao,),
+        ).fetchall()
+        return {
+            "id_avaliacao": id_avaliacao, "identificador": row["Login"],
+            "equipe": row["NomeEquipe"], "periodo": row["Data"],
+            "score_geral": row["ScoreGeral"], "margem_erro": row["MargemErroGeral"],
+            "itens_faltantes": row["ItensFaltantes"],
+            "pilares": {p: {"score": v, "margem_erro": margens.get(p)} for p, v in scores.items()},
+            "historico": [{"data": h["Data"], "score_geral": h["ScoreGeral"]} for h in historico],
+            "respostas": [{"pilar": r["Pilar"], "pergunta": r["Pergunta"], "nota": r["Nota"]}
+                          for r in respostas],
+        }
+
+
 # =====================================================================
-# FUNÇÕES DE LEITURA E ESCRITA (AGENTE 2 E GERADOR DE PDF)
+# FUNÇÕES DE LEITURA E ESCRITA DO AGENTE 2
 # =====================================================================
 def buscar_dados_equipe_para_relatorio(id_equipe: int) -> dict:
     """Busca os dados do banco, consolida os scores do grupo e monta o dicionário para o Agente 2 e o PDF."""
@@ -257,7 +269,6 @@ def buscar_dados_equipe_para_relatorio(id_equipe: int) -> dict:
                 "margem_erro": 0.20 if score_medio_grupo is not None else None,
                 "pilares": pilares_grupo,
                 "historico": historico_grupo,
-                "rotina_e_prazos": None,  # Preenchido depois pelas APIs do Calendar/Teams
             },
             "membros": membros,
         }
@@ -272,17 +283,15 @@ def salvar_relatorio_agente2(
     margem_erro_pilares: dict,
     analise: str,
     conclusao: str,
-    snapshot_api: dict | None = None,
 ) -> int:
-    """Salva o relatório consolidado do grupo gerado pelo Agente 2."""
     with get_connection() as conn:
         cur = conn.execute(
             """
             INSERT INTO RelatorioEquipe (
                 IdEquipe, DataRelatorio, ScoreGeral, MargemErroGeral,
                 ScorePilaresJSON, MargemErroPilaresJSON,
-                AnaliseAgente, ConclusaoAgente, SnapshotContextoAPIJSON
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                AnaliseAgente, ConclusaoAgente
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 id_equipe,
@@ -293,7 +302,6 @@ def salvar_relatorio_agente2(
                 json.dumps(margem_erro_pilares, ensure_ascii=False),
                 analise,
                 conclusao,
-                json.dumps(snapshot_api, ensure_ascii=False) if snapshot_api else None,
             ),
         )
         return cur.lastrowid
@@ -306,6 +314,87 @@ def deletar_usuario(id_usuario: int) -> None:
     """Apaga o usuário e, automaticamente, todas as suas avaliações e respostas."""
     with get_connection() as conn:
         conn.execute("DELETE FROM Usuario WHERE IdUsuario = ?", (id_usuario,))
+
+
+class ConexaoSQLite(sqlite3.Connection):
+    def __exit__(self, *args):
+        try:
+            return super().__exit__(*args)
+        finally:
+            self.close()
+
+
+def get_connection() -> sqlite3.Connection:
+    """Abre uma conexão configurada com o SQLite."""
+    conn = sqlite3.connect(DB_PATH, factory=ConexaoSQLite)
+    conn.row_factory = sqlite3.Row  # Permite acessar colunas pelo nome: row["NomeEquipe"]
+    conn.execute("PRAGMA foreign_keys = ON;")
+    conn.execute("PRAGMA journal_mode = WAL;")
+    return conn
+
+
+def init_db() -> None:
+    """Cria as tabelas do banco caso ainda não existam."""
+    schema_sql = """
+    CREATE TABLE IF NOT EXISTS Equipe (
+        IdEquipe INTEGER PRIMARY KEY AUTOINCREMENT,
+        NomeEquipe TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS Usuario (
+        IdUsuario INTEGER PRIMARY KEY AUTOINCREMENT,
+        Login TEXT NOT NULL UNIQUE,
+        Senha TEXT NOT NULL,
+        IsRH INTEGER NOT NULL DEFAULT 0, -- 0 = Colaborador, 1 = RH
+        IdEquipe INTEGER,
+        FOREIGN KEY (IdEquipe) REFERENCES Equipe(IdEquipe) ON DELETE SET NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS Avaliacao (
+        IdAvaliacao INTEGER PRIMARY KEY AUTOINCREMENT,
+        IdUsuario INTEGER NOT NULL,
+        Data TEXT NOT NULL, -- Formato recomendado: YYYY-MM-DD
+        ScoreGeral REAL,
+        MargemErroGeral REAL,
+        ScorePilaresJSON TEXT,      -- Ex: {"Exaustão": 3.8, "Distanciamento Mental": 3.1, ...}
+        MargemErroPilaresJSON TEXT, -- Ex: {"Exaustão": 0.4, "Distanciamento Mental": 0.3, ...}
+        FOREIGN KEY (IdUsuario) REFERENCES Usuario(IdUsuario) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS Respostas (
+        IdRespostas INTEGER PRIMARY KEY AUTOINCREMENT,
+        IdAvaliacao INTEGER NOT NULL,
+        Pilar TEXT NOT NULL,
+        Pergunta TEXT NOT NULL,
+        Resposta TEXT NOT NULL,
+        Nota INTEGER NOT NULL,
+        JustificativaAgente TEXT NOT NULL,
+        FOREIGN KEY (IdAvaliacao) REFERENCES Avaliacao(IdAvaliacao) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS RelatorioEquipe (
+        IdRelatorio INTEGER PRIMARY KEY AUTOINCREMENT,
+        IdEquipe INTEGER NOT NULL,
+        DataRelatorio TEXT NOT NULL, -- Formato recomendado: YYYY-MM ou YYYY-MM-DD
+        ScoreGeral REAL,
+        MargemErroGeral REAL,
+        ScorePilaresJSON TEXT,
+        MargemErroPilaresJSON TEXT,
+        AnaliseAgente TEXT,
+        ConclusaoAgente TEXT,
+        FOREIGN KEY (IdEquipe) REFERENCES Equipe(IdEquipe) ON DELETE CASCADE
+    );
+    """
+
+    with get_connection() as conn:
+        conn.executescript(schema_sql)
+        colunas = [c["name"] for c in conn.execute("PRAGMA table_info(Avaliacao)")]
+        if "ItensFaltantes" not in colunas:
+            conn.execute("ALTER TABLE Avaliacao ADD COLUMN ItensFaltantes INTEGER DEFAULT 0")
+        colunas_equipe = {c["name"] for c in conn.execute("PRAGMA table_info(Equipe)")}
+        for coluna in ("IdCalendarioGoogle", "IdEquipeTeams"):
+            if coluna not in colunas_equipe:
+                conn.execute(f"ALTER TABLE Equipe ADD COLUMN {coluna} TEXT")
 
 
 if __name__ == "__main__":

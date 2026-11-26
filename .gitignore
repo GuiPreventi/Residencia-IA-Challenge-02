@@ -10,3 +10,6 @@ __pycache__/
 relatorio_*.pdf
 grafico.png
 preview_*.png
+relatorios/
+simulacao/
+BancoDados/
