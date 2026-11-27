@@ -1,0 +1,14 @@
+# RAG e Banco Vetorial (ingestao.py, rag.py)
+chromadb>=0.4.0
+sentence-transformers>=2.2.0
+pyyaml>=6.0
+
+# LLM e Orquestração de Agentes (criaDoc.py, comunicacao_agentes.py)
+ollama>=0.5.1
+langgraph>=0.2.0
+pydantic>=2.0.0
+typing-extensions>=4.0.0
+
+# Renderização de Templates e Geração de PDF (criaDoc.py, relatorio_individual.py)
+jinja2>=3.1.0
+weasyprint>=60.0
